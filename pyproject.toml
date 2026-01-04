@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mosaic-attention"
+version = "0.1.0"
+description = "Multi-Axis Attention Sharding for PyTorch"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+]
+
+[project.optional-dependencies]
+ring = ["ring-flash-attn>=0.1.0", "flash-attn>=2.0.0"]
+dev = ["pytest>=7.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
