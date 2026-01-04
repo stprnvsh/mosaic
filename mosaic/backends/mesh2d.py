@@ -87,7 +87,7 @@ def mesh2d_attention(
     **kwargs
 ) -> torch.Tensor:
     """
-    2D mesh attention using all-gather along rows and cols.
+    2D mesh attention using all-gather along cols + FlashAttention.
     
     Each GPU has:
         q: (batch, heads, seq_local_q, head_dim) - local Q shard
@@ -96,7 +96,7 @@ def mesh2d_attention(
     
     Algorithm:
         1. All-gather K, V along column group (get full K, V for this Q shard)
-        2. Compute local attention
+        2. Compute attention via F.scaled_dot_product_attention (uses FlashAttention)
         3. Result is already correctly sharded
     
     Args:
@@ -109,37 +109,45 @@ def mesh2d_attention(
     Returns:
         Attention output (batch, heads, seq_local, head_dim)
     """
-    # Get sizes
+    import torch.nn.functional as F
+    
     col_world_size = dist.get_world_size(col_group)
     
+    if col_world_size == 1:
+        # No gathering needed, use FlashAttention directly
+        return F.scaled_dot_product_attention(q, k, v)
+    
     # All-gather K, V along column dimension
-    # Each GPU in the same row needs all K, V from its column
-    k_gathered = _all_gather_along_seq(k, col_group)
-    v_gathered = _all_gather_along_seq(v, col_group)
+    k_gathered = _all_gather_along_seq(k, col_group, col_world_size)
+    v_gathered = _all_gather_along_seq(v, col_group, col_world_size)
     
-    # Compute attention with local Q against gathered K, V
-    # Using scaled dot-product attention
-    scale = q.shape[-1] ** -0.5
-    attn_weights = torch.matmul(q, k_gathered.transpose(-2, -1)) * scale
-    attn_weights = torch.softmax(attn_weights, dim=-1)
-    output = torch.matmul(attn_weights, v_gathered)
-    
-    return output
+    # Use FlashAttention - O(n) memory, fused kernels
+    return F.scaled_dot_product_attention(q, k_gathered, v_gathered)
 
 
-def _all_gather_along_seq(x: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+def _all_gather_along_seq(
+    x: torch.Tensor, 
+    group: dist.ProcessGroup,
+    world_size: int
+) -> torch.Tensor:
     """All-gather tensor along sequence dimension."""
-    world_size = dist.get_world_size(group)
-    
     if world_size == 1:
         return x
     
     # x: (batch, heads, seq_local, head_dim)
-    gathered = [torch.empty_like(x) for _ in range(world_size)]
-    dist.all_gather(gathered, x, group=group)
+    batch, heads, seq_local, head_dim = x.shape
     
-    # Concatenate along sequence dimension
-    return torch.cat(gathered, dim=2)
+    # Pre-allocate output tensor
+    output = torch.empty(
+        batch, heads, seq_local * world_size, head_dim,
+        dtype=x.dtype, device=x.device
+    )
+    
+    # Gather into pre-allocated slices (avoids torch.cat allocation)
+    output_list = list(output.chunk(world_size, dim=2))
+    dist.all_gather(output_list, x.contiguous(), group=group)
+    
+    return output
 
 
 class Mesh2DContext:

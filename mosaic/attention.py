@@ -99,51 +99,46 @@ class MultiAxisAttention(nn.Module):
         Returns:
             Tensor of same shape as input
         """
-        original_shape = x.shape
-        ndim = x.ndim
+        # Step 1: Move attention axis to seq position (-2)
+        x, inv_perm = self._permute_to_seq(x)
         
-        # Step 1: Move attention axis to position -2 (seq position)
-        x, perm, inv_perm = self._permute_to_seq(x)
-        
-        # Step 2: Flatten batch dimensions -> (batch, seq, embed)
+        # Step 2: Flatten batch dims -> (batch, seq, embed)
         batch_shape = x.shape[:-2]
-        batch_size = x.shape[:-2].numel() if len(batch_shape) > 0 else 1
         seq_len = x.shape[-2]
-        x = x.reshape(batch_size, seq_len, self.embed_dim)
+        x = x.view(-1, seq_len, self.embed_dim)
+        batch_size = x.shape[0]
         
-        # Step 3: Project Q, K, V
-        qkv = self.qkv_proj(x)  # (batch, seq, 3 * embed)
-        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, batch, heads, seq, head_dim)
-        q, k, v = qkv.unbind(0)
+        # Step 3: Project Q, K, V (fused projection)
+        qkv = self.qkv_proj(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # (batch, heads, seq, head_dim)
         
-        # Step 4: Attention via selected backend
+        # Step 4: Attention via backend
         out = self._attn_fn(q, k, v)
         
-        # Step 5: Reshape and project output
-        out = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.embed_dim)
+        # Step 5: Reshape and project
+        out = out.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         out = self.out_proj(out)
         
-        # Step 6: Restore original shape
-        out = out.reshape(*batch_shape, seq_len, self.embed_dim)
-        out = out.permute(inv_perm)
+        # Step 6: Restore shape
+        if batch_shape:
+            out = out.view(*batch_shape, seq_len, self.embed_dim)
+        if inv_perm:
+            out = out.permute(inv_perm)
         
         return out
     
-    def _permute_to_seq(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[int], List[int]]:
+    def _permute_to_seq(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[List[int]]]:
         """
         Move attention_axis to position -2 (standard seq position).
         
         Returns:
-            (permuted_tensor, permutation, inverse_permutation)
+            (permuted_tensor, inverse_permutation or None if no permute needed)
         """
         ndim = x.ndim
         ax = self.attention_axis if self.attention_axis >= 0 else ndim + self.attention_axis
         
         if ax == ndim - 2:
-            # Already in correct position
-            identity = list(range(ndim))
-            return x, identity, identity
+            return x, None  # Already in correct position
         
         # Build permutation: all dims except ax, then ax, then last dim
         perm = [i for i in range(ndim) if i != ax and i != ndim - 1]
@@ -155,7 +150,7 @@ class MultiAxisAttention(nn.Module):
         for i, p in enumerate(perm):
             inv_perm[p] = i
         
-        return x.permute(perm), perm, inv_perm
+        return x.permute(perm), inv_perm
     
     def _local_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Standard local attention (no communication)."""
@@ -230,92 +225,52 @@ class MultiAxisAttention2D(nn.Module):
         Args:
             x: Tensor with shape (..., dim1, dim2, embed)
         """
-        original_shape = x.shape
-        
-        # Flatten the two attention axes into one sequence dimension
-        # Move axis1, axis2 to positions -3, -2
+        # Flatten two attention axes into one sequence dim
         x, restore_info = self._flatten_axes(x)
+        batch_size, seq_len = x.shape[0], x.shape[1]
         
-        # Now x is (batch, seq, embed) where seq = dim1 * dim2
-        batch_size, seq_len, _ = x.shape
-        
-        # Project Q, K, V
-        qkv = self.qkv_proj(x)
-        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        # Project Q, K, V (fused)
+        qkv = self.qkv_proj(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         
         # 2D mesh attention
-        out = mesh2d_attention(
-            q, k, v,
-            row_group=self._mesh2d_ctx.row_group,
-            col_group=self._mesh2d_ctx.col_group
-        )
+        out = mesh2d_attention(q, k, v, self._mesh2d_ctx.row_group, self._mesh2d_ctx.col_group)
         
         # Reshape and project
-        out = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.embed_dim)
+        out = out.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         out = self.out_proj(out)
         
         # Restore original shape
-        out = self._unflatten_axes(out, restore_info)
-        
-        return out
+        return self._unflatten_axes(out, restore_info)
     
-    def _flatten_axes(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+    def _flatten_axes(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
         """Flatten axis1 and axis2 into a single sequence dimension."""
         ndim = x.ndim
         ax1 = self.axis1 if self.axis1 >= 0 else ndim + self.axis1
         ax2 = self.axis2 if self.axis2 >= 0 else ndim + self.axis2
-        
-        # Ensure ax1 < ax2
         if ax1 > ax2:
             ax1, ax2 = ax2, ax1
         
-        dim1 = x.shape[ax1]
-        dim2 = x.shape[ax2]
+        dim1, dim2 = x.shape[ax1], x.shape[ax2]
         
-        # Build permutation to move ax1, ax2 to end (before embed)
+        # Permute ax1, ax2 to positions -3, -2
         other_dims = [i for i in range(ndim) if i not in (ax1, ax2, ndim-1)]
         perm = other_dims + [ax1, ax2, ndim-1]
-        
         x = x.permute(perm)
         
-        # Flatten ax1, ax2 into single dim
         batch_shape = x.shape[:-3]
-        x = x.reshape(*batch_shape, dim1 * dim2, self.embed_dim)
+        x = x.view(-1, dim1 * dim2, self.embed_dim)
         
-        # Further flatten batch dims
-        batch_size = x.shape[:-2].numel() if len(batch_shape) > 0 else 1
-        x = x.reshape(batch_size, dim1 * dim2, self.embed_dim)
-        
-        restore_info = {
-            'batch_shape': batch_shape,
-            'dim1': dim1,
-            'dim2': dim2,
-            'perm': perm,
-            'original_shape': x.shape,
-        }
-        
-        return x, restore_info
-    
-    def _unflatten_axes(self, x: torch.Tensor, info: dict) -> torch.Tensor:
-        """Restore original shape after attention."""
-        batch_shape = info['batch_shape']
-        dim1, dim2 = info['dim1'], info['dim2']
-        perm = info['perm']
-        
-        # Unflatten batch dims
-        x = x.reshape(*batch_shape, dim1 * dim2, self.embed_dim)
-        
-        # Unflatten sequence dim
-        x = x.reshape(*batch_shape, dim1, dim2, self.embed_dim)
-        
-        # Inverse permutation
+        # Precompute inverse permutation
         inv_perm = [0] * len(perm)
         for i, p in enumerate(perm):
             inv_perm[p] = i
         
-        x = x.permute(inv_perm)
-        
-        return x
+        return x, (batch_shape, dim1, dim2, inv_perm)
+    
+    def _unflatten_axes(self, x: torch.Tensor, info: Tuple) -> torch.Tensor:
+        """Restore original shape after attention."""
+        batch_shape, dim1, dim2, inv_perm = info
+        x = x.view(*batch_shape, dim1, dim2, self.embed_dim)
+        return x.permute(inv_perm)
 

@@ -13,9 +13,13 @@ Example: Hierarchical
 """
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Optional, List, Tuple, Literal
 from dataclasses import dataclass
+
+from mosaic.backends.mesh2d import create_2d_mesh, mesh2d_attention
+from mosaic.backends.ring import ring_attention, RING_AVAILABLE
 
 
 @dataclass
@@ -57,17 +61,23 @@ class ComposedAttention:
             head_parallel: Whether to shard attention heads across mesh rows
             seq_parallel: How to shard sequence ("ring" across cols, "mesh2d", or "none")
         """
-        from mosaic.backends.mesh2d import create_2d_mesh
-        
         self.mesh_shape = mesh_shape
         self.head_parallel = head_parallel
         self.seq_parallel = seq_parallel
         
-        # Create mesh groups
+        # Create mesh groups once at init
         self.row_group, self.col_group, self.row_rank, self.col_rank = create_2d_mesh(mesh_shape)
         
         self.row_size = mesh_shape[0]
         self.col_size = mesh_shape[1]
+        
+        # Pre-select attention function (avoid branching in forward)
+        if seq_parallel == "ring":
+            self._attn_fn = self._ring_attention
+        elif seq_parallel == "mesh2d":
+            self._attn_fn = self._mesh2d_attention
+        else:
+            self._attn_fn = self._local_attention
     
     def __call__(
         self,
@@ -83,26 +93,18 @@ class ComposedAttention:
             k: (batch, heads_local, seq_local, head_dim)
             v: (batch, heads_local, seq_local, head_dim)
         """
-        if self.seq_parallel == "ring":
-            return self._ring_attention(q, k, v)
-        elif self.seq_parallel == "mesh2d":
-            return self._mesh2d_attention(q, k, v)
-        else:
-            return self._local_attention(q, k, v)
+        return self._attn_fn(q, k, v)
     
     def _local_attention(self, q, k, v):
         """Standard local attention."""
-        import torch.nn.functional as F
         return F.scaled_dot_product_attention(q, k, v)
     
     def _ring_attention(self, q, k, v):
         """Ring attention within column group."""
-        from mosaic.backends.ring import ring_attention
         return ring_attention(q, k, v, group=self.col_group)
     
     def _mesh2d_attention(self, q, k, v):
         """2D mesh attention."""
-        from mosaic.backends.mesh2d import mesh2d_attention
         return mesh2d_attention(q, k, v, self.row_group, self.col_group)
     
     def shard_qkv(
@@ -197,16 +199,22 @@ class HierarchicalAttention:
         num_nodes = world_size // intra_node_size
         self.node_id = rank // intra_node_size
         self.local_rank = rank % intra_node_size
+        self.leader_src = self.node_id * intra_node_size
         
         # Create intra-node groups
-        intra_ranks = list(range(self.node_id * intra_node_size, 
-                                  (self.node_id + 1) * intra_node_size))
+        intra_ranks = list(range(self.leader_src, self.leader_src + intra_node_size))
         self.intra_group = dist.new_group(intra_ranks)
         
         # Create inter-node groups (one representative per node)
         inter_ranks = [i * intra_node_size for i in range(num_nodes)]
         self.inter_group = dist.new_group(inter_ranks)
         self.is_node_leader = (self.local_rank == 0)
+        
+        # Pre-select intra-node attention function
+        if intra_node_strategy == "mesh2d":
+            self._intra_attn = lambda q, k, v: mesh2d_attention(q, k, v, self.intra_group, self.intra_group)
+        else:
+            self._intra_attn = F.scaled_dot_product_attention
     
     def __call__(self, q, k, v):
         """
@@ -214,24 +222,17 @@ class HierarchicalAttention:
         1. Intra-node attention (fast)
         2. Inter-node aggregation (if needed)
         """
-        if self.intra_node_strategy == "local":
-            # Each GPU computes attention locally within its data shard
-            import torch.nn.functional as F
-            local_out = F.scaled_dot_product_attention(q, k, v)
-        else:
-            from mosaic.backends.mesh2d import mesh2d_attention
-            # Mesh2d within node
-            local_out = mesh2d_attention(q, k, v, self.intra_group, self.intra_group)
+        # Intra-node attention
+        local_out = self._intra_attn(q, k, v)
         
         # Inter-node: ring attention between node leaders
-        if self.inter_node_strategy == "ring" and self.is_node_leader:
-            from mosaic.backends.ring import ring_attention
+        if self.is_node_leader and self.inter_node_strategy == "ring":
             out = ring_attention(local_out, local_out, local_out, group=self.inter_group)
         else:
             out = local_out
         
         # Broadcast from leader to rest of node
-        dist.broadcast(out, src=self.node_id * self.intra_node_size, group=self.intra_group)
+        dist.broadcast(out, src=self.leader_src, group=self.intra_group)
         
         return out
 
