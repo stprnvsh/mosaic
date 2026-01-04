@@ -79,11 +79,38 @@ PyTorch / NCCL
 ### `mosaic.init(sp_size=1)`
 Initialize Mosaic context with sequence parallel size.
 
-### `mosaic.MultiAxisAttention(embed_dim, num_heads, attention_axis, backend)`
-Attention layer that operates over any tensor axis.
+### `mosaic.MultiAxisAttention(embed_dim, num_heads, attention_axis, backend, mesh_shape)`
+Attention layer that operates over any single tensor axis.
 
 - `attention_axis`: Which axis to compute attention over
-- `backend`: `"local"` (no communication) or `"ring"` (ring attention across GPUs)
+- `backend`: 
+  - `"local"`: No communication, single GPU
+  - `"ring"`: 1D ring attention across GPUs
+  - `"mesh2d"`: 2D mesh sharding (requires `mesh_shape`)
+- `mesh_shape`: Required for mesh2d, e.g., `(2, 2)` for 4 GPUs
+
+### `mosaic.MultiAxisAttention2D(embed_dim, num_heads, axis1, axis2, mesh_shape)`
+Attention over TWO axes simultaneously (e.g., rows × columns).
+
+### `mosaic.ComposedAttention(mesh_shape, head_parallel, seq_parallel)`
+Combine multiple sharding strategies:
+- Head parallelism across one mesh dimension
+- Sequence parallelism (ring or mesh2d) across another
+
+Example:
+```python
+# 8 GPUs: 2-way head parallel × 4-way sequence parallel
+composed = mosaic.ComposedAttention(
+    mesh_shape=(2, 4),
+    head_parallel=True,
+    seq_parallel="ring"
+)
+```
+
+### `mosaic.HierarchicalAttention(intra_node_size, inter_node_strategy, intra_node_strategy)`
+Two-level attention for multi-node clusters:
+- Fast intra-node communication (NVLink)
+- Slower inter-node communication (network)
 
 ## License
 
