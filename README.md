@@ -226,6 +226,96 @@ Communication uses NCCL collectives:
 | 100k - 1M | 8-64 | `ring` or `mesh2d` | O(n²/p) or O(n²/p²) |
 | > 1M | 64+ | `mesh2d` + `head_parallel` | O(n²/(p²·h)) |
 
+## Distributed Launch
+
+### Single Node
+
+```bash
+# 4 GPUs on one machine
+torchrun --nproc_per_node=4 train.py
+```
+
+### Multi-Node
+
+```bash
+# Node 0 (master) - replace IP with your master node
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
+    --master_addr=192.168.1.100 --master_port=29500 train.py
+
+# Node 1
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
+    --master_addr=192.168.1.100 --master_port=29500 train.py
+```
+
+### SLURM
+
+```bash
+#!/bin/bash
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=8
+#SBATCH --gpus-per-node=8
+
+srun torchrun \
+    --nnodes=$SLURM_NNODES \
+    --nproc_per_node=8 \
+    --rdzv_id=$SLURM_JOB_ID \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1):29500 \
+    train.py
+```
+
+### Training Script Setup
+
+```python
+import os
+import torch
+import torch.distributed as dist
+import mosaic
+
+def main():
+    # torchrun sets RANK, LOCAL_RANK, WORLD_SIZE automatically
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    
+    # Initialize Mosaic with full world for sequence parallelism
+    ctx = mosaic.init(sp_size=dist.get_world_size())
+    
+    model = MyModel().to(ctx.device)
+    
+    # Each GPU loads its shard of the sequence
+    total_seq = 150000
+    local_seq = total_seq // dist.get_world_size()
+    x_local = load_my_shard(local_seq)  # Your data loading
+    
+    # Forward pass - ring communication automatic
+    out = model(x_local)
+    
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
+```
+
+### Multi-Node Mesh Configuration
+
+```python
+# 2 nodes × 4 GPUs = 8 total
+# Option 1: Head parallel across nodes (slow), seq parallel within (fast)
+composed = mosaic.ComposedAttention(
+    mesh_shape=(2, 4),      # (nodes, gpus_per_node)
+    head_parallel=True,     # Across nodes
+    seq_parallel="ring"     # Within node
+)
+
+# Option 2: Explicit hierarchical control
+hier = mosaic.HierarchicalAttention(
+    intra_node_size=4,           # GPUs per node
+    intra_node_strategy="local", # No comm within node
+    inter_node_strategy="ring"   # Ring between node leaders
+)
+```
+
 ## Architecture
 
 ```
