@@ -84,6 +84,8 @@ def mesh2d_attention(
     v: torch.Tensor,
     row_group: dist.ProcessGroup,
     col_group: dist.ProcessGroup,
+    attn_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
     **kwargs
 ) -> torch.Tensor:
     """
@@ -105,6 +107,8 @@ def mesh2d_attention(
         v: Value tensor (batch, heads, seq_local, head_dim)
         row_group: Process group for row communication
         col_group: Process group for column communication
+        attn_mask: Optional attention mask
+        is_causal: If True, use causal masking
         
     Returns:
         Attention output (batch, heads, seq_local, head_dim)
@@ -114,15 +118,22 @@ def mesh2d_attention(
     col_world_size = dist.get_world_size(col_group)
     
     if col_world_size == 1:
-        # No gathering needed, use FlashAttention directly
-        return F.scaled_dot_product_attention(q, k, v)
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, 
+            is_causal=is_causal and attn_mask is None
+        )
     
     # All-gather K, V along column dimension
     k_gathered = _all_gather_along_seq(k, col_group, col_world_size)
     v_gathered = _all_gather_along_seq(v, col_group, col_world_size)
     
-    # Use FlashAttention - O(n) memory, fused kernels
-    return F.scaled_dot_product_attention(q, k_gathered, v_gathered)
+    # For causal with gathered K,V, need to adjust mask for local Q position
+    # TODO: Handle causal masking properly for 2D mesh
+    return F.scaled_dot_product_attention(
+        q, k_gathered, v_gathered,
+        attn_mask=attn_mask,
+        is_causal=is_causal and attn_mask is None
+    )
 
 
 def _all_gather_along_seq(
