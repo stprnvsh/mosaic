@@ -32,7 +32,7 @@ from mosaic.backends.composed import ComposedAttention, HierarchicalAttention
 from mosaic.backends.mesh2d import Mesh2DContext
 from mosaic.backends.mesh3d import Mesh3DContext
 
-__version__ = "0.2.0"
+__version__ = "0.2.0"  # Keep in sync with pyproject.toml
 
 __all__ = [
     # Core

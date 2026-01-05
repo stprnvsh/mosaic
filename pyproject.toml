@@ -4,19 +4,50 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mosaic-attention"
-version = "0.1.0"
-description = "Multi-Axis Attention Sharding for PyTorch"
+version = "0.2.0"
+description = "Multi-Axis Attention Sharding for PyTorch - Distribute attention across GPUs"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
+authors = [
+    {name = "Pranav Sateesh", email = "stprnvsh@example.com"}
+]
+keywords = [
+    "pytorch",
+    "attention",
+    "distributed",
+    "multi-gpu",
+    "transformer",
+    "ring-attention",
+    "sequence-parallel",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/stprnvsh/mosaic"
+Repository = "https://github.com/stprnvsh/mosaic"
+Documentation = "https://github.com/stprnvsh/mosaic#readme"
+
 [project.optional-dependencies]
-ring = ["ring-flash-attn>=0.1.0", "flash-attn>=2.0.0"]
-dev = ["pytest>=7.0.0"]
+ring = ["flash-attn>=2.0.0"]
+dev = ["pytest>=7.0.0", "build", "twine"]
+all = ["flash-attn>=2.0.0"]
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["mosaic*"]
 
