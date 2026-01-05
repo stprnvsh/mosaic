@@ -137,7 +137,7 @@ class MultiAxisAttention(nn.Module):
         # Step 2: Flatten batch dims -> (batch, seq, embed)
         batch_shape = x.shape[:-2]
         seq_len = x.shape[-2]
-        x = x.view(-1, seq_len, self.embed_dim)
+        x = x.contiguous().view(-1, seq_len, self.embed_dim)
         batch_size = x.shape[0]
         
         # Step 3: Core attention (optionally checkpointed)
