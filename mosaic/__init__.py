@@ -31,6 +31,12 @@ from mosaic.backends import get_available_backends
 from mosaic.backends.composed import ComposedAttention, HierarchicalAttention
 from mosaic.backends.mesh2d import Mesh2DContext
 from mosaic.backends.mesh3d import Mesh3DContext
+from mosaic.hierarchical import (
+    HierarchicalMetaAttention,
+    MultiAxisHierarchicalAttention,
+    ChunkSummaryEncoder,
+    MetaAttention,
+)
 
 __version__ = "0.2.0"  # Keep in sync with pyproject.toml
 
@@ -49,4 +55,9 @@ __all__ = [
     "HierarchicalAttention",
     "Mesh2DContext",
     "Mesh3DContext",
+    # Hierarchical Meta-Attention
+    "HierarchicalMetaAttention",
+    "MultiAxisHierarchicalAttention",
+    "ChunkSummaryEncoder",
+    "MetaAttention",
 ]
