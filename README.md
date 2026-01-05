@@ -75,11 +75,11 @@ For very large sequences, shard both Q and K:
 ## Installation
 
 ```bash
+pip install mosaic-attention
+
+# Or from source with ring attention
 git clone https://github.com/stprnvsh/mosaic.git
 cd mosaic
-pip install -e .
-
-# With ring attention (requires FlashAttention)
 pip install -e ".[ring]"
 ```
 
@@ -204,6 +204,51 @@ hier = mosaic.HierarchicalAttention(
     intra_node_strategy="local", # Fast NVLink within node
     inter_node_strategy="ring"   # Slower network between nodes
 )
+```
+
+#### `mosaic.HierarchicalMetaAttention` (NEW in v0.3)
+**Learned routing** via chunk summaries. Instead of communicating with all chunks (O(p) in ring), meta-attention learns which chunks are relevant and only communicates with top-k.
+
+```python
+attn = mosaic.HierarchicalMetaAttention(
+    embed_dim=256,
+    num_heads=8,
+    summary_dim=64,   # Compress each chunk to this dim
+    top_k=2,          # Only attend to top-k relevant chunks
+    use_checkpoint=True
+)
+
+out, meta = attn(x_local)
+print(meta['routing_weights'])  # Shows which chunks are relevant
+# e.g., tensor([[0.05, 0.40, 0.15, 0.40]]) → chunks 1 and 3 are most relevant
+```
+
+**How it works:**
+1. Local attention within each GPU's chunk
+2. Compress chunks into summaries (content + attention pattern stats)
+3. `all_gather` summaries (small: only `summary_dim` per GPU)
+4. Meta-attention computes routing weights
+5. Soft-weighted cross-attention using routing weights
+6. Gated combination of local + cross outputs
+
+**Benefits:**
+- **Communication:** O(1) gather + O(top_k) vs O(p) ring rounds
+- **Interpretability:** `routing_weights` tells you which regions interact
+- **Sparse attention:** Learns which long-range dependencies matter
+
+**Use cases:** Genomics (gene regulation), long documents (topic routing), time series (seasonal patterns)
+
+#### `mosaic.MultiAxisHierarchicalAttention`
+Convenience wrapper with axis permutation (same API as `MultiAxisAttention`).
+
+```python
+attn = mosaic.MultiAxisHierarchicalAttention(
+    embed_dim=256, num_heads=8,
+    attention_axis=1,  # Attend over this axis
+    summary_dim=64,
+    top_k=2
+)
+out, meta = attn(x)  # Works with any N-dimensional tensor
 ```
 
 ## Performance
